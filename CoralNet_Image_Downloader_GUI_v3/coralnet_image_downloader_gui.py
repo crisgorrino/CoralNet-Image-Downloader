@@ -8,7 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
-import traceback
+import webbrowser
 from pathlib import Path
 from typing import Optional
 
@@ -21,7 +21,8 @@ except ImportError as exc:
         "Install Python 3 from python.org and try again."
     ) from exc
 
-from coralnet_downloader_core import DownloadSummary, VERSION, run_download
+from coralnet_downloader_core import DownloadSummary, VERSION, TEST_LIMIT, run_download
+from coralnet_session import CoralNetSession, safe_error
 
 
 class CoralNetDownloaderApp(tk.Tk):
@@ -35,11 +36,14 @@ class CoralNetDownloaderApp(tk.Tk):
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
         self.current_output: Optional[Path] = None
+        self.session = CoralNetSession()
+        self.auth_var = tk.StringVar(value="Not connected")
+        self.confirmed_var = tk.BooleanVar(value=False)
 
         self.url_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.test_mode_var = tk.BooleanVar(value=False)
-        self.limit_var = tk.IntVar(value=3)
+        self.limit_var = tk.IntVar(value=TEST_LIMIT)
         self.open_when_done_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_text_var = tk.StringVar(value="")
@@ -63,8 +67,7 @@ class CoralNetDownloaderApp(tk.Tk):
         subtitle = ttk.Label(
             outer,
             text=(
-                "Download every original-resolution image from a public "
-                "CoralNet source."
+                "Download original-resolution images from public or authorized private CoralNet sources."
             ),
         )
         subtitle.pack(anchor="w", pady=(2, 16))
@@ -109,13 +112,21 @@ class CoralNetDownloaderApp(tk.Tk):
         options = ttk.LabelFrame(outer, text="Options", padding=10)
         options.pack(fill="x", pady=(10, 12))
 
+        self.connect_button = ttk.Button(options, text="Connect to CoralNet", command=self._connect)
+        self.connect_button.grid(row=0, column=0, sticky="w")
+        ttk.Label(options, textvariable=self.auth_var).grid(row=0, column=1, columnspan=2, sticky="w", padx=10)
+        self.disconnect_button = ttk.Button(options, text="Disconnect", command=self._disconnect)
+        self.disconnect_button.grid(row=0, column=3, padx=8)
+        self.confirmed_checkbox = ttk.Checkbutton(options, text="Confirmed images only", variable=self.confirmed_var)
+        self.confirmed_checkbox.grid(row=1, column=0, columnspan=4, sticky="w", pady=8)
+
         self.test_checkbox = ttk.Checkbutton(
             options,
             text="Test mode — download only the first",
             variable=self.test_mode_var,
             command=self._toggle_test_mode,
         )
-        self.test_checkbox.grid(row=0, column=0, sticky="w")
+        self.test_checkbox.grid(row=2, column=0, sticky="w")
 
         self.limit_spinbox = ttk.Spinbox(
             options,
@@ -125,14 +136,14 @@ class CoralNetDownloaderApp(tk.Tk):
             textvariable=self.limit_var,
             state="disabled",
         )
-        self.limit_spinbox.grid(row=0, column=1, padx=(6, 4))
-        ttk.Label(options, text="images").grid(row=0, column=2, sticky="w")
+        self.limit_spinbox.grid(row=2, column=1, padx=(6, 4))
+        ttk.Label(options, text="images").grid(row=2, column=2, sticky="w")
 
         ttk.Checkbutton(
             options,
             text="Open the output folder when finished",
             variable=self.open_when_done_var,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=(0, 12))
@@ -214,6 +225,55 @@ class CoralNetDownloaderApp(tk.Tk):
             state="normal" if self.test_mode_var.get() else "disabled"
         )
 
+    def _disconnect(self) -> None:
+        self.session.disconnect()
+        self.auth_var.set(self.session.state)
+
+    def _connect(self) -> None:
+        webbrowser.open("https://coralnet.ucsd.edu/accounts/login/")
+        dialog = tk.Toplevel(self)
+        dialog.title("Connect to CoralNet")
+        dialog.transient(self)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=(
+            "Log in to CoralNet in your browser normally.\n"
+            "In browser developer tools, open Application/Storage → Cookies\n"
+            "for https://coralnet.ucsd.edu and copy the sessionid value.\n"
+            "Safari: Web Inspector → Storage → Cookies.\n\n"
+            "Paste only that value below. It stays in memory until you disconnect\n"
+            "or exit. Never send it in chat, email, or screenshots.\n"
+            "The application never asks for or stores your CoralNet password."
+        ), justify="left").pack(anchor="w")
+        entry = ttk.Entry(frame, show="•", width=55)
+        entry.pack(fill="x", pady=12)
+
+        def dismiss():
+            entry.delete(0, "end")
+            dialog.destroy()
+
+        def verify():
+            cookie = entry.get()
+            dismiss()
+            self.stop_event.clear()
+            self.auth_var.set("Connecting…")
+            self._set_running(True)
+            self.worker = threading.Thread(target=self._connect_worker, args=(cookie,), daemon=True)
+            self.worker.start()
+
+        ttk.Button(frame, text="Verify local session", command=verify).pack(side="left")
+        ttk.Button(frame, text="Cancel", command=dismiss).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dismiss)
+        entry.focus_set()
+
+    def _connect_worker(self, cookie: str) -> None:
+        try:
+            self.session.connect(cookie, self.stop_event)
+            self.events.put(("connected",))
+        except Exception as exc:
+            self.events.put(("error", safe_error(exc), ""))
+
     def _browse_output(self) -> None:
         selected = filedialog.askdirectory(
             title="Choose an output folder",
@@ -227,11 +287,13 @@ class CoralNetDownloaderApp(tk.Tk):
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", message.rstrip() + "\n")
+        self.log_text.insert("end", safe_error(RuntimeError(message)).rstrip() + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
     def _set_running(self, running: bool) -> None:
+        for control in (self.connect_button, self.disconnect_button, self.confirmed_checkbox, self.limit_spinbox):
+            control.configure(state="disabled" if running else "normal")
         self.start_button.configure(
             state="disabled" if running else "normal"
         )
@@ -263,7 +325,11 @@ class CoralNetDownloaderApp(tk.Tk):
         if self.output_var.get().strip():
             requested_output = Path(self.output_var.get().strip())
 
-        limit = self.limit_var.get() if self.test_mode_var.get() else 0
+        try:
+            limit = self.limit_var.get() if self.test_mode_var.get() else 0
+        except tk.TclError:
+            messagebox.showerror("Invalid test limit", "Enter a positive integer for the test limit.")
+            return
         if limit < 1 and self.test_mode_var.get():
             messagebox.showerror(
                 "Invalid test limit",
@@ -287,7 +353,7 @@ class CoralNetDownloaderApp(tk.Tk):
 
         self.worker = threading.Thread(
             target=self._worker_main,
-            args=(source, requested_output, limit),
+            args=(source, requested_output, limit, self.confirmed_var.get()),
             daemon=True,
         )
         self.worker.start()
@@ -297,12 +363,15 @@ class CoralNetDownloaderApp(tk.Tk):
         source: str,
         requested_output: Optional[Path],
         limit: int,
+        confirmed_only: bool,
     ) -> None:
         try:
             summary = run_download(
                 source_input=source,
                 requested_output=requested_output,
                 limit=limit,
+                confirmed_only=confirmed_only,
+                session=self.session,
                 stop_event=self.stop_event,
                 log=lambda message: self.events.put(("log", message)),
                 status=lambda message: self.events.put(
@@ -320,8 +389,8 @@ class CoralNetDownloaderApp(tk.Tk):
             self.events.put(
                 (
                     "error",
-                    str(exc),
-                    traceback.format_exc(),
+                    safe_error(exc),
+                    "",
                 )
             )
 
@@ -356,6 +425,11 @@ class CoralNetDownloaderApp(tk.Tk):
                     self._finish(event[1])
                 elif kind == "error":
                     self._fail(event[1], event[2])
+                elif kind == "connected":
+                    self._set_running(False)
+                    self.auth_var.set(self.session.state)
+                    self.confirmed_var.set(True)
+                    self.status_var.set("Connected to CoralNet")
         except queue.Empty:
             pass
         finally:
@@ -379,6 +453,7 @@ class CoralNetDownloaderApp(tk.Tk):
         )
 
     def _finish(self, summary: DownloadSummary) -> None:
+        self.auth_var.set(self.session.state)
         self.progress.stop()
         self._set_running(False)
         self.current_output = summary.output_dir
@@ -391,6 +466,13 @@ class CoralNetDownloaderApp(tk.Tk):
             f"Already present: {summary.already_present}    "
             f"Failed: {summary.failed}"
         )
+
+        if summary.discovered == 0:
+            message = "No confirmed images were found in this source." if self.confirmed_var.get() else "No images were found in this source."
+            self.status_var.set(message)
+            self._append_log(message)
+            messagebox.showinfo("No matching images", message)
+            return
 
         if summary.cancelled:
             self.status_var.set(
@@ -432,12 +514,12 @@ class CoralNetDownloaderApp(tk.Tk):
             )
 
     def _fail(self, message: str, details: str) -> None:
+        self.auth_var.set(self.session.state)
         self.progress.stop()
         self._set_running(False)
         self.status_var.set("Error")
         self.progress_text_var.set("")
         self._append_log(f"ERROR: {message}")
-        self._append_log(details)
         messagebox.showerror("CoralNet download error", message)
 
     def _open_output(self) -> None:
@@ -473,6 +555,7 @@ class CoralNetDownloaderApp(tk.Tk):
             if not close:
                 return
             self.stop_event.set()
+        self.session.disconnect()
         self.destroy()
 
 
