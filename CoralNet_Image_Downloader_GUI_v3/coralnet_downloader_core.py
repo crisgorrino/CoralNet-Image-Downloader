@@ -9,17 +9,22 @@ import html
 import os
 import re
 import time
-from dataclasses import dataclass
+from datetime import datetime
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
+from http.client import HTTPException
 from pathlib import Path
 from threading import Event
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from coralnet_session import CoralNetSession, AccessError, SignedURLExpired, safe_error
 
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
+TEST_LIMIT = 10
 HOST = "coralnet.ucsd.edu"
 USER_AGENT = f"Mozilla/5.0 (compatible; CoralNetImageDownloader/{VERSION})"
 
@@ -41,12 +46,13 @@ MANIFEST_FIELDS = [
     "source_id",
     "image_id",
     "original_filename",
-    "saved_filename",
-    "status",
+    "local_filename",
+    "annotation_status",
+    "download_status",
     "bytes",
     "sha256",
-    "detail_url",
-    "image_storage_path",
+    "image_detail_url",
+    "downloaded_at",
     "error",
 ]
 
@@ -68,6 +74,8 @@ class SourceInfo:
     total_pages: int
     reported_count: Optional[int]
     details: Tuple[Tuple[str, str], ...]
+    annotation_states: Tuple[Tuple[str, str], ...] = ()
+    confirmed_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,8 +83,9 @@ class ImageRecord:
     image_id: str
     detail_url: str
     original_filename: str
-    image_url: str
+    image_url: str = field(repr=False)
     storage_path: str
+    annotation_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -100,6 +109,12 @@ class CoralNetHTMLParser(HTMLParser):
         self.text_parts: List[str] = []
         self.title_parts: List[str] = []
         self._in_title = False
+        self.original_srcs: List[str] = []
+        self._original_depth = 0
+        self._image_id = ""
+        self.annotation_states: Dict[str, str] = {}
+        self._select = ""
+        self.confirmed_selected = False
 
     @property
     def title(self) -> str:
@@ -114,14 +129,37 @@ class CoralNetHTMLParser(HTMLParser):
     def handle_starttag(self, tag, attrs) -> None:
         values = dict(attrs)
         tag = tag.lower()
+        if tag == "div":
+            if values.get("id") == "original_image_container":
+                self._original_depth = 1
+            elif self._original_depth:
+                self._original_depth += 1
+        if tag == "select":
+            self._select = values.get("name", "")
+        if tag == "option" and self._select == "annotation_status":
+            if values.get("value") == "confirmed" and "selected" in values:
+                self.confirmed_selected = True
         if tag == "a" and values.get("href"):
             self.hrefs.append(values["href"])
+            match = IMAGE_DETAIL_RE.match(urlsplit(values["href"]).path)
+            self._image_id = match.group(1) if match else ""
         elif tag == "img" and values.get("src"):
             self.srcs.append(values["src"])
+            if self._original_depth:
+                self.original_srcs.append(values["src"])
+            states = set(values.get("class", "").split()) & {"confirmed", "unconfirmed", "unclassified"}
+            if self._image_id and states:
+                self.annotation_states[self._image_id] = states.pop()
         elif tag == "title":
             self._in_title = True
 
     def handle_endtag(self, tag) -> None:
+        if tag.lower() == "div" and self._original_depth:
+            self._original_depth -= 1
+        if tag.lower() == "a":
+            self._image_id = ""
+        if tag.lower() == "select":
+            self._select = ""
         if tag.lower() == "title":
             self._in_title = False
 
@@ -160,17 +198,29 @@ def normalize_source(value: str) -> Tuple[str, str]:
             )
         source_id = match.group(1)
 
-    browse_url = f"https://{HOST}/source/{source_id}/browse/images/"
+    browse_url = build_browse_url(source_id)
     return source_id, browse_url
 
 
+def build_browse_url(source_id: str, annotation_status: Optional[str] = None,
+                     page: Optional[int] = None) -> str:
+    if not str(source_id).isdigit() or annotation_status not in {None, "confirmed"}:
+        raise ValueError("Invalid source ID or annotation filter.")
+    query = {}
+    if annotation_status:
+        query["annotation_status"] = annotation_status
+    if page is not None:
+        if page < 1:
+            raise ValueError("Page number must be positive.")
+        query["page"] = str(page)
+    base = f"https://{HOST}/source/{source_id}/browse/images/"
+    return base + ("?" + urlencode(query) if query else "")
+
+
 def _page_url(base_url: str, page_number: int) -> str:
-    parts = urlsplit(base_url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query["page"] = str(page_number)
-    return urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
-    )
+    source_id, _ = normalize_source(base_url)
+    query = dict(parse_qsl(urlsplit(base_url).query))
+    return build_browse_url(source_id, "confirmed" if query.get("annotation_status") == "confirmed" else None, page_number)
 
 
 def _request(
@@ -179,6 +229,7 @@ def _request(
     timeout: float,
     retries: int,
     accept: str,
+    session: Optional[CoralNetSession] = None,
 ) -> Tuple[bytes, Dict[str, str], str]:
     last_error: Optional[BaseException] = None
 
@@ -193,7 +244,7 @@ def _request(
                     "Accept-Encoding": "identity",
                 },
             )
-            with urlopen(request, timeout=timeout) as response:
+            with (session or CoralNetSession()).open(request, timeout=timeout) as response:
                 headers = {
                     key.lower(): value
                     for key, value in response.headers.items()
@@ -201,14 +252,14 @@ def _request(
                 return response.read(), headers, response.geturl()
         except DownloadCancelled:
             raise
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        except (HTTPError, URLError, HTTPException, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt < retries:
                 for _ in range(min(2 ** (attempt - 1), 8) * 10):
                     _check_cancel(stop_event)
                     time.sleep(0.1)
 
-    raise RuntimeError(f"Unable to fetch {url}: {last_error}")
+    raise RuntimeError(f"Unable to fetch page: {safe_error(last_error)}") from None
 
 
 def _fetch_html(
@@ -216,20 +267,25 @@ def _fetch_html(
     stop_event: Event,
     timeout: float,
     retries: int,
+    session: Optional[CoralNetSession] = None,
 ) -> Tuple[str, str]:
+    session = session or CoralNetSession()
     body, headers, final_url = _request(
         url,
         stop_event,
         timeout,
         retries,
         "text/html,application/xhtml+xml,*/*;q=0.8",
+        session,
     )
     content_type = headers.get("content-type", "")
     charset_match = re.search(
         r"charset=([^\s;]+)", content_type, re.IGNORECASE
     )
     charset = charset_match.group(1) if charset_match else "utf-8"
-    return body.decode(charset, errors="replace"), final_url
+    document = body.decode(charset, errors="replace")
+    session.check_html(document, final_url)
+    return document, final_url
 
 
 def _safe_folder_name(name: str) -> str:
@@ -246,7 +302,7 @@ def _safe_filename(name: str, image_id: str) -> str:
 
     if not name:
         name = f"coralnet_{image_id}.jpg"
-    if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
+    if not Path(name).suffix:
         name += ".jpg"
     return name
 
@@ -273,20 +329,20 @@ def discover_source(
     timeout: float,
     retries: int,
     delay: float,
+    confirmed_only: bool = False,
+    session: Optional[CoralNetSession] = None,
+    max_pages: int = 5000,
 ) -> SourceInfo:
     source_id, browse_url = normalize_source(source_input)
+    session = session or CoralNetSession()
+    browse_url = build_browse_url(source_id, "confirmed" if confirmed_only else None)
     status("Connecting to CoralNet…")
     progress(0, 0, "Scanning source")
     log(f"Connecting to source {source_id}: {browse_url}")
 
     first_html, final_url = _fetch_html(
-        browse_url, stop_event, timeout, retries
+        browse_url, stop_event, timeout, retries, session
     )
-    if "/accounts/login" in urlsplit(final_url).path.lower():
-        raise RuntimeError(
-            "This source requires a CoralNet login. The desktop downloader "
-            "currently supports public sources only."
-        )
 
     parser = CoralNetHTMLParser()
     parser.feed(first_html)
@@ -294,6 +350,8 @@ def discover_source(
 
     page_match = PAGE_COUNT_RE.search(parser.visible_text)
     total_pages = int(page_match.group(1)) if page_match else 1
+    if total_pages > max_pages:
+        raise RuntimeError("Source exceeds the browse-page safety limit.")
 
     count_match = IMAGE_COUNT_RE.search(parser.visible_text)
     reported_count = (
@@ -303,13 +361,18 @@ def discover_source(
     )
 
     detail_map: Dict[str, str] = {}
+    annotation_states: Dict[str, str] = {}
 
     def add_page(document: str, current_url: str) -> None:
         page_parser = CoralNetHTMLParser()
         page_parser.feed(document)
+        if confirmed_only and not page_parser.confirmed_selected:
+            raise RuntimeError("CoralNet did not acknowledge the confirmed filter; discovery stopped.")
+        annotation_states.update(page_parser.annotation_states)
         for href in page_parser.hrefs:
             absolute = urljoin(current_url, href)
-            match = IMAGE_DETAIL_RE.match(urlsplit(absolute).path)
+            parts = urlsplit(absolute)
+            match = IMAGE_DETAIL_RE.match(parts.path) if parts.hostname == HOST and parts.scheme == "https" else None
             if match:
                 detail_map.setdefault(match.group(1), absolute)
 
@@ -325,26 +388,30 @@ def discover_source(
         progress(page_number - 1, total_pages, "Scanning source")
         current_url = _page_url(browse_url, page_number)
         document, _ = _fetch_html(
-            current_url, stop_event, timeout, retries
+            current_url, stop_event, timeout, retries, session
         )
         add_page(document, current_url)
         if delay:
-            time.sleep(delay)
+            if stop_event.wait(delay):
+                _check_cancel(stop_event)
 
-    if not detail_map and reported_count != 0:
+    if not detail_map and reported_count != 0 and not re.search(r"no images|no results|0 images", parser.visible_text, re.I):
         raise RuntimeError(
-            "No image records were found. The source may be private, empty, "
-            "or CoralNet's page layout may have changed."
+            "No image records were found; CoralNet's page layout may have changed."
         )
 
     if reported_count is not None and len(detail_map) != reported_count:
-        log(
-            "Warning: CoralNet reported "
+        raise RuntimeError(
+            "CoralNet reported "
             f"{reported_count} images, but {len(detail_map)} unique image "
-            "records were discovered."
+            "records were discovered; discovery stopped to avoid an incomplete dataset."
         )
 
     log(f"Unique image records found: {len(detail_map)}")
+    if confirmed_only and any(value != "confirmed" for value in annotation_states.values()):
+        raise RuntimeError("CoralNet returned an image outside the confirmed filter; discovery stopped.")
+    if not detail_map and confirmed_only:
+        log("No confirmed images were found in this source.")
     return SourceInfo(
         source_id=source_id,
         browse_url=browse_url,
@@ -352,6 +419,8 @@ def discover_source(
         total_pages=total_pages,
         reported_count=reported_count,
         details=tuple(detail_map.items()),
+        annotation_states=tuple(annotation_states.items()),
+        confirmed_only=confirmed_only,
     )
 
 
@@ -372,9 +441,10 @@ def _extract_record(
     stop_event: Event,
     timeout: float,
     retries: int,
+    session: Optional[CoralNetSession] = None,
 ) -> ImageRecord:
     document, final_url = _fetch_html(
-        detail_url, stop_event, timeout, retries
+        detail_url, stop_event, timeout, retries, session
     )
     if "/accounts/login" in urlsplit(final_url).path.lower():
         raise RuntimeError("Login required for this image.")
@@ -387,12 +457,14 @@ def _extract_record(
         if parser.title
         else ""
     )
-    filename = _safe_filename(filename, image_id)
+    if not filename:
+        raise RuntimeError("CoralNet image filename is missing; page layout may have changed.")
 
     candidates: List[str] = []
-    for raw_url in parser.hrefs + parser.srcs:
+    for raw_url in parser.original_srcs or (parser.hrefs + parser.srcs):
         absolute = urljoin(detail_url, raw_url)
-        if "/media/images/" in urlsplit(absolute).path.lower():
+        parts = urlsplit(absolute)
+        if parts.scheme == "https" and "/media/images/" in parts.path.lower() and not RESIZED_IMAGE_RE.search(Path(parts.path).name):
             candidates.append(absolute)
 
     candidates = list(dict.fromkeys(candidates))
@@ -411,6 +483,9 @@ def _extract_record(
         original_filename=filename,
         image_url=image_url,
         storage_path=storage_path,
+        annotation_status=("confirmed" if re.search(r"Annotation status:\s*Confirmed", parser.visible_text, re.I)
+                           else "unconfirmed" if re.search(r"Annotation status:\s*Unconfirmed", parser.visible_text, re.I)
+                           else "unclassified" if re.search(r"Annotation status:\s*Unclassified", parser.visible_text, re.I) else ""),
     )
 
 
@@ -447,7 +522,10 @@ def _download_file(
     stop_event: Event,
     timeout: float,
     retries: int,
+    session: Optional[CoralNetSession] = None,
+    refresh_url: Optional[Callable[[], str]] = None,
 ) -> Tuple[int, str]:
+    session = session or CoralNetSession()
     temp_path = destination.with_name(destination.name + ".part")
     last_error: Optional[BaseException] = None
 
@@ -465,7 +543,14 @@ def _download_file(
             digest = hashlib.sha256()
             byte_count = 0
 
-            with urlopen(request, timeout=timeout) as response:
+            with session.open(request, timeout=timeout) as response:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "html" in content_type:
+                    document = response.read(1024 * 1024).decode("utf-8", errors="replace")
+                    if urlsplit(response.geturl()).hostname == HOST:
+                        session.check_html(document, response.geturl())
+                    raise RuntimeError("The image request returned an HTML page.")
+                expected_length = response.headers.get("Content-Length")
                 with temp_path.open("wb") as output:
                     while True:
                         _check_cancel(stop_event)
@@ -476,6 +561,9 @@ def _download_file(
                         digest.update(block)
                         byte_count += len(block)
 
+            if expected_length is not None and byte_count != int(expected_length):
+                raise RuntimeError("The download was interrupted before completion.")
+
             if byte_count == 0 or not _file_looks_valid(temp_path):
                 raise RuntimeError(
                     "The downloaded response was empty or was not an image."
@@ -483,13 +571,18 @@ def _download_file(
 
             temp_path.replace(destination)
             return byte_count, digest.hexdigest()
-        except DownloadCancelled:
+        except (DownloadCancelled, AccessError):
             try:
                 temp_path.unlink()
             except OSError:
                 pass
             raise
-        except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
+        except SignedURLExpired:
+            temp_path.unlink(missing_ok=True)
+            if refresh_url is None or attempt == retries:
+                raise RuntimeError("Temporary image URL refresh failed.") from None
+            url = refresh_url()
+        except (HTTPError, URLError, HTTPException, TimeoutError, OSError, RuntimeError) as exc:
             last_error = exc
             try:
                 temp_path.unlink()
@@ -500,7 +593,7 @@ def _download_file(
                     _check_cancel(stop_event)
                     time.sleep(0.1)
 
-    raise RuntimeError(f"Download failed: {last_error}")
+    raise RuntimeError(f"Download failed: {safe_error(last_error)}") from None
 
 
 def _load_manifest(path: Path) -> Dict[str, Dict[str, str]]:
@@ -513,6 +606,11 @@ def _load_manifest(path: Path) -> Dict[str, Dict[str, str]]:
             for row in csv.DictReader(handle):
                 image_id = (row.get("image_id") or "").strip()
                 if image_id:
+                    # Read v3 and the original CLI manifests without retaining URLs.
+                    row["local_filename"] = row.get("local_filename") or row.get("saved_filename") or row.get("filename", "")
+                    row["download_status"] = row.get("download_status") or row.get("status", "")
+                    row["image_detail_url"] = row.get("image_detail_url") or row.get("detail_url", "")
+                    row["error"] = safe_error(RuntimeError(row.get("error", ""))) if row.get("error") else ""
                     rows[image_id] = row
     except (OSError, csv.Error) as exc:
         raise RuntimeError(f"Could not read the existing manifest: {exc}")
@@ -533,6 +631,8 @@ def _write_manifest(
                 field: rows[image_id].get(field, "")
                 for field in MANIFEST_FIELDS
             }
+            # The only persisted URL is a canonical, unsigned CoralNet detail URL.
+            row["image_detail_url"] = f"https://{HOST}/image/{image_id}/view/" if image_id.isdigit() else ""
             writer.writerow(row)
     temp_path.replace(path)
 
@@ -581,9 +681,16 @@ def run_download(
     output_ready: OutputCallback,
     timeout: float = 90.0,
     retries: int = 4,
-    delay: float = 0.15,
+    delay: float = 0.25,
+    confirmed_only: bool = False,
+    session: Optional[CoralNetSession] = None,
+    list_only: bool = False,
+    max_pages: int = 5000,
 ) -> DownloadSummary:
-    """Discover and download one public CoralNet source."""
+    """Discover and download one permitted CoralNet source."""
+    session = session or CoralNetSession()
+    log_callback = log
+    log = lambda message: log_callback(safe_error(RuntimeError(message)))
     source = discover_source(
         source_input=source_input,
         stop_event=stop_event,
@@ -593,6 +700,9 @@ def run_download(
         timeout=timeout,
         retries=retries,
         delay=delay,
+        confirmed_only=confirmed_only,
+        session=session,
+        max_pages=max_pages,
     )
     _check_cancel(stop_event)
 
@@ -611,31 +721,54 @@ def run_download(
 
     manifest_path = output_dir / "download_manifest.csv"
     manifest = _load_manifest(manifest_path)
-    used_names: set[str] = set()
+    foreign_sources = {row.get("source_id") for row in manifest.values()} - {None, "", source.source_id}
+    if foreign_sources:
+        raise RuntimeError("This output folder contains a different source; choose a separate folder.")
+    used_names: set[str] = {path.name.casefold() for path in output_dir.iterdir()} | {
+        "download_manifest.csv", "download_errors.txt", "source_info.txt",
+        "download_manifest.csv.tmp", "source_info.txt.tmp",
+    }
     completed_ids: set[str] = set()
+    manifest_names: set[str] = set()
 
     for image_id, row in manifest.items():
         if row.get("source_id") not in {"", source.source_id}:
             continue
-        saved_name = row.get("saved_filename", "")
+        saved_name = row.get("local_filename", "")
         if saved_name:
+            if saved_name.casefold() in manifest_names:
+                raise RuntimeError("Existing manifest assigns one filename to multiple images; choose a new folder.")
+            manifest_names.add(saved_name.casefold())
             used_names.add(saved_name.casefold())
+        if saved_name and (Path(saved_name).name != saved_name or saved_name in {".", ".."} or "/" in saved_name or "\\" in saved_name or saved_name.endswith(".part")):
+            raise RuntimeError("Unsafe filename in existing manifest.")
         destination = output_dir / saved_name if saved_name else None
+        if destination is not None and destination.is_symlink():
+            raise RuntimeError("Symlink image destinations are not supported.")
         try:
             expected_size = int(row.get("bytes") or 0)
         except ValueError:
             expected_size = 0
 
         if (
-            row.get("status") in {"downloaded", "already_present"}
+            row.get("download_status") in {"downloaded", "already_present"}
             and destination is not None
             and _file_looks_valid(destination)
             and (
-                expected_size == 0
-                or destination.stat().st_size == expected_size
+                expected_size > 0
+                and destination.stat().st_size == expected_size
             )
+            and bool(row.get("sha256"))
+            and _sha256(destination, stop_event) == row["sha256"]
         ):
             completed_ids.add(image_id)
+
+    selected_ids = {image_id for image_id, _ in details}
+    completed_ids &= selected_ids
+    states = dict(source.annotation_states)
+    for image_id in completed_ids:
+        manifest[image_id]["annotation_status"] = states.get(image_id, "confirmed" if confirmed_only else "")
+    _write_manifest(manifest_path, manifest)
 
     pending = [
         (image_id, detail_url)
@@ -647,27 +780,43 @@ def run_download(
     log(f"Remaining this run: {len(pending)}")
     log(f"Output folder: {output_dir}")
 
-    source_info = (
-        "CoralNet image download\n"
-        "========================\n\n"
-        f"Project: {source.project_name}\n"
-        f"Source ID: {source.source_id}\n"
-        f"Browse URL: {source.browse_url}\n"
-        f"Images discovered for this run: {len(details)}\n"
-        f"Downloader version: {VERSION}\n\n"
-        "The CSV manifest intentionally excludes temporary signed URL "
-        "query credentials.\n"
-    )
-    (output_dir / "SOURCE_INFO.txt").write_text(
-        source_info, encoding="utf-8"
-    )
-
     downloaded = 0
     already_present = 0
     failed = 0
+    run_state = "in progress"
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    authentication = "authenticated CoralNet session" if session.is_authenticated() else "public access"
+
+    def write_source_info():
+        text = (
+            "CoralNet Image Downloader\n\n"
+            f"Project: {source.project_name}\n"
+            f"Source ID: {source.source_id}\n"
+            f"Source URL: https://{HOST}/source/{source.source_id}/\n"
+            f"Downloaded: {started_at}\n"
+            f"Filter: {'annotation_status=confirmed' if confirmed_only else 'none'}\n"
+            f"Authentication: {authentication}\n"
+            f"Images discovered: {len(source.details)}\n"
+            f"Images selected: {len(details)}\n"
+            f"Images completed: {len(completed_ids) + downloaded + already_present}\n"
+            f"Images failed: {failed}\n"
+            f"Test limit: {limit}\n"
+            f"Run status: {run_state}\n"
+            f"Downloader version: {VERSION}\n\n"
+            "Source contents may change; this is not an immutable CoralNet snapshot.\n"
+        )
+        info_path = output_dir / "SOURCE_INFO.txt"
+        temporary = info_path.with_suffix(".txt.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(info_path)
+
+    write_source_info()
 
     if not pending:
-        status("All images are already downloaded.")
+        run_state = "complete"
+        write_source_info()
+        status(("No confirmed images were found in this source." if confirmed_only else "No images were found in this source.")
+               if not details else "All images are already downloaded.")
         progress(len(details), len(details), "Complete")
         return DownloadSummary(
             project_name=source.project_name,
@@ -697,13 +846,17 @@ def run_download(
                     stop_event=stop_event,
                     timeout=timeout,
                     retries=retries,
+                    session=session,
                 )
 
+                if confirmed_only and record.annotation_status and record.annotation_status != "confirmed":
+                    raise RuntimeError("Image annotation status changed after discovery; skipped.")
+
                 previous_name = manifest.get(image_id, {}).get(
-                    "saved_filename", ""
+                    "local_filename", ""
                 )
                 saved_name = previous_name or _unique_name(
-                    record.original_filename, image_id, used_names
+                    _safe_filename(record.original_filename, image_id), image_id, used_names
                 )
                 destination = output_dir / saved_name
 
@@ -711,18 +864,21 @@ def run_download(
                     f"Downloading {index} of {len(pending)}: {saved_name}"
                 )
 
-                if _file_looks_valid(destination):
-                    file_size = destination.stat().st_size
-                    checksum = _sha256(destination, stop_event)
-                    row_status = "already_present"
-                    already_present += 1
+                # Only checksum-verified manifest entries are skipped above.
+                # Unknown files reserve names; failed/incomplete files restart atomically.
+                if list_only:
+                    file_size, checksum, row_status = 0, "", "listed"
                 else:
+                    def refresh_original_url():
+                        fresh = _extract_record(image_id, detail_url, stop_event, timeout, retries, session)
+                        if confirmed_only and fresh.annotation_status and fresh.annotation_status != "confirmed":
+                            raise RuntimeError("Image annotation status changed after discovery; skipped.")
+                        return fresh.image_url
+
                     file_size, checksum = _download_file(
-                        record.image_url,
-                        destination,
-                        stop_event,
-                        timeout,
-                        retries,
+                        record.image_url, destination, stop_event, timeout, retries,
+                        session=session,
+                        refresh_url=refresh_original_url,
                     )
                     row_status = "downloaded"
                     downloaded += 1
@@ -731,19 +887,20 @@ def run_download(
                     "source_id": source.source_id,
                     "image_id": image_id,
                     "original_filename": record.original_filename,
-                    "saved_filename": saved_name,
-                    "status": row_status,
+                    "local_filename": saved_name,
+                    "download_status": row_status,
                     "bytes": str(file_size),
                     "sha256": checksum,
-                    "detail_url": record.detail_url,
-                    "image_storage_path": record.storage_path,
+                    "image_detail_url": record.detail_url,
+                    "annotation_status": "confirmed" if confirmed_only else record.annotation_status or dict(source.annotation_states).get(image_id, ""),
+                    "downloaded_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                     "error": "",
                 }
                 log(
                     f"[{index}/{len(pending)}] {row_status}: "
                     f"{saved_name} ({_human_size(file_size)})"
                 )
-            except DownloadCancelled:
+            except (DownloadCancelled, AccessError):
                 raise
             except Exception as exc:
                 failed += 1
@@ -754,27 +911,38 @@ def run_download(
                     "original_filename": prior.get(
                         "original_filename", ""
                     ),
-                    "saved_filename": prior.get("saved_filename", ""),
-                    "status": "failed",
+                    "local_filename": prior.get("local_filename", ""),
+                    "download_status": "failed",
                     "bytes": prior.get("bytes", "0"),
                     "sha256": prior.get("sha256", ""),
-                    "detail_url": detail_url,
-                    "image_storage_path": prior.get(
-                        "image_storage_path", ""
-                    ),
-                    "error": str(exc),
+                    "image_detail_url": detail_url,
+                    "annotation_status": dict(source.annotation_states).get(image_id, ""),
+                    "downloaded_at": "",
+                    "error": safe_error(exc),
                 }
                 log(
                     f"[{index}/{len(pending)}] ERROR image "
-                    f"{image_id}: {exc}"
+                    f"{image_id}: {safe_error(exc)}"
                 )
 
+                with (output_dir / "download_errors.txt").open("a", encoding="utf-8") as errors:
+                    errors.write(f"Image {image_id}: {safe_error(exc)}\n")
+
             _write_manifest(manifest_path, manifest)
+            write_source_info()
             progress(index, len(pending), "Downloading")
             if delay:
-                time.sleep(delay)
+                if stop_event.wait(delay):
+                    _check_cancel(stop_event)
 
+    except AccessError:
+        run_state = "stopped: access denied or session expired"
+        _write_manifest(manifest_path, manifest)
+        write_source_info()
+        raise
     except DownloadCancelled:
+        run_state = "cancelled"
+        write_source_info()
         _write_manifest(manifest_path, manifest)
         status("Download cancelled. Run again to resume.")
         return DownloadSummary(
@@ -789,6 +957,8 @@ def run_download(
             cancelled=True,
         )
 
+    run_state = "finished with errors" if failed else "complete"
+    write_source_info()
     status(
         "Finished with errors."
         if failed

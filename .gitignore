@@ -21,3 +21,23 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+
+# Local research output and ephemeral files (never ignore session.py source).
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.part
+downloads/
+output/
+download_manifest.csv
+download_errors.txt
+SOURCE_INFO.txt
+cookies.txt
+cookies.json
+cookies-*.txt
+cookies-*.json
+session-cookies.*
+auth-session.*
